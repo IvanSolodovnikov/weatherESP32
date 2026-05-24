@@ -17,6 +17,8 @@
 
 #define AHT20_ADDR 0x38
 #define BMP280_ADDR 0x77
+#define BH1750_ADDR_PRIMARY 0x23
+#define BH1750_ADDR_SECONDARY 0x5C
 
 #define BMP280_REG_ID 0xD0
 #define BMP280_REG_RESET 0xE0
@@ -25,6 +27,10 @@
 #define BMP280_REG_CONFIG 0xF5
 #define BMP280_REG_CALIB 0x88
 #define BMP280_REG_PRESS_MSB 0xF7
+
+#define BH1750_CMD_POWER_ON 0x01
+#define BH1750_CMD_RESET 0x07
+#define BH1750_CMD_CONT_HIGH_RES 0x10
 
 static const char *TAG = "weather";
 
@@ -48,6 +54,8 @@ typedef struct {
 
 static i2c_master_bus_handle_t i2c_bus;
 static i2c_master_dev_handle_t aht20_dev;
+static i2c_master_dev_handle_t bh1750_dev;
+static uint8_t bh1750_addr;
 
 static esp_err_t i2c_add_device(uint8_t addr, i2c_master_dev_handle_t *dev)
 {
@@ -129,6 +137,10 @@ static void i2c_scan(void)
              esp_err_to_name(i2c_master_probe(i2c_bus, AHT20_ADDR, 100)));
     ESP_LOGI(TAG, "Probe 0x%02X result: %s", BMP280_ADDR,
              esp_err_to_name(i2c_master_probe(i2c_bus, BMP280_ADDR, 100)));
+    ESP_LOGI(TAG, "Probe 0x%02X result: %s", BH1750_ADDR_PRIMARY,
+             esp_err_to_name(i2c_master_probe(i2c_bus, BH1750_ADDR_PRIMARY, 100)));
+    ESP_LOGI(TAG, "Probe 0x%02X result: %s", BH1750_ADDR_SECONDARY,
+             esp_err_to_name(i2c_master_probe(i2c_bus, BH1750_ADDR_SECONDARY, 100)));
     ESP_LOGI(TAG, "I2C idle levels after scan: SDA=%d SCL=%d",
              gpio_get_level(I2C_SDA_GPIO),
              gpio_get_level(I2C_SCL_GPIO));
@@ -170,6 +182,47 @@ static esp_err_t aht20_read(float *temperature_c, float *humidity_percent)
 
     *humidity_percent = ((float)raw_humidity * 100.0f) / 1048576.0f;
     *temperature_c = ((float)raw_temperature * 200.0f) / 1048576.0f - 50.0f;
+
+    return ESP_OK;
+}
+
+static esp_err_t bh1750_init(void)
+{
+    bh1750_addr = BH1750_ADDR_PRIMARY;
+    esp_err_t err = i2c_master_probe(i2c_bus, bh1750_addr, 100);
+
+    if (err != ESP_OK) {
+        bh1750_addr = BH1750_ADDR_SECONDARY;
+        err = i2c_master_probe(i2c_bus, bh1750_addr, 100);
+    }
+
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    ESP_RETURN_ON_ERROR(i2c_add_device(bh1750_addr, &bh1750_dev), TAG, "BH1750 add device failed");
+
+    const uint8_t power_on = BH1750_CMD_POWER_ON;
+    const uint8_t reset = BH1750_CMD_RESET;
+    const uint8_t mode = BH1750_CMD_CONT_HIGH_RES;
+
+    ESP_RETURN_ON_ERROR(i2c_write(bh1750_dev, &power_on, 1), TAG, "BH1750 power on failed");
+    ESP_RETURN_ON_ERROR(i2c_write(bh1750_dev, &reset, 1), TAG, "BH1750 reset failed");
+    ESP_RETURN_ON_ERROR(i2c_write(bh1750_dev, &mode, 1), TAG, "BH1750 mode set failed");
+    vTaskDelay(pdMS_TO_TICKS(180));
+
+    ESP_LOGI(TAG, "BH1750 found at 0x%02X", bh1750_addr);
+    return ESP_OK;
+}
+
+static esp_err_t bh1750_read(float *lux)
+{
+    uint8_t data[2] = {0};
+
+    ESP_RETURN_ON_ERROR(i2c_read(bh1750_dev, data, sizeof(data)), TAG, "BH1750 read failed");
+
+    uint16_t raw_lux = ((uint16_t)data[0] << 8) | data[1];
+    *lux = (float)raw_lux / 1.2f;
 
     return ESP_OK;
 }
@@ -283,12 +336,14 @@ void app_main(void)
     bmp280_t bmp = {0};
     bool aht20_ready = false;
     bool bmp280_ready = false;
+    bool bh1750_ready = false;
 
     ESP_ERROR_CHECK(i2c_init());
     i2c_scan();
 
     aht20_ready = (aht20_init() == ESP_OK);
     bmp280_ready = (bmp280_init(&bmp) == ESP_OK);
+    bh1750_ready = (bh1750_init() == ESP_OK);
 
     if (!aht20_ready) {
         ESP_LOGW(TAG, "AHT20 not found at 0x%02X", AHT20_ADDR);
@@ -296,12 +351,16 @@ void app_main(void)
     if (!bmp280_ready) {
         ESP_LOGW(TAG, "BMP280 not found at 0x%02X", BMP280_ADDR);
     }
+    if (!bh1750_ready) {
+        ESP_LOGW(TAG, "BH1750 not found at 0x%02X or 0x%02X", BH1750_ADDR_PRIMARY, BH1750_ADDR_SECONDARY);
+    }
 
     while (true) {
         float aht_temperature = NAN;
         float humidity = NAN;
         float bmp_temperature = NAN;
         float pressure = NAN;
+        float lux = NAN;
 
         if (aht20_ready && aht20_read(&aht_temperature, &humidity) != ESP_OK) {
             ESP_LOGW(TAG, "AHT20 read failed");
@@ -311,12 +370,17 @@ void app_main(void)
             ESP_LOGW(TAG, "BMP280 read failed");
         }
 
+        if (bh1750_ready && bh1750_read(&lux) != ESP_OK) {
+            ESP_LOGW(TAG, "BH1750 read failed");
+        }
+
         ESP_LOGI(TAG,
-                 "AHT20: %.2f C, %.2f %%RH | BMP280: %.2f C, %.2f hPa",
+                 "AHT20: %.2f C, %.2f %%RH | BMP280: %.2f C, %.2f hPa | BH1750: %.2f lx",
                  aht_temperature,
                  humidity,
                  bmp_temperature,
-                 pressure);
+                 pressure,
+                 lux);
 
         vTaskDelay(pdMS_TO_TICKS(5000));
     }

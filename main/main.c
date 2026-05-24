@@ -1,14 +1,24 @@
 #include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "esp_check.h"
 #include "esp_err.h"
+#include "esp_event.h"
+#include "esp_http_server.h"
 #include "esp_log.h"
+#include "esp_netif.h"
+#include "esp_timer.h"
+#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "nvs_flash.h"
+#include "sdkconfig.h"
 
 #define I2C_PORT I2C_NUM_0
 #define I2C_SDA_GPIO GPIO_NUM_21
@@ -32,7 +42,21 @@
 #define BH1750_CMD_RESET 0x07
 #define BH1750_CMD_CONT_HIGH_RES 0x10
 
+#define SAMPLE_PERIOD_MS 5000
+#define WIFI_CONNECTED_BIT BIT0
+#define WIFI_FAIL_BIT BIT1
+#define WIFI_MAX_RETRY 10
+
 static const char *TAG = "weather";
+
+typedef struct {
+    float aht_temperature;
+    float humidity;
+    float bmp_temperature;
+    float pressure;
+    float lux;
+    uint32_t uptime_s;
+} sensor_snapshot_t;
 
 typedef struct {
     i2c_master_dev_handle_t dev;
@@ -56,6 +80,16 @@ static i2c_master_bus_handle_t i2c_bus;
 static i2c_master_dev_handle_t aht20_dev;
 static i2c_master_dev_handle_t bh1750_dev;
 static uint8_t bh1750_addr;
+static SemaphoreHandle_t weather_lock;
+static sensor_snapshot_t current_weather = {
+    .aht_temperature = NAN,
+    .humidity = NAN,
+    .bmp_temperature = NAN,
+    .pressure = NAN,
+    .lux = NAN,
+};
+static EventGroupHandle_t wifi_event_group;
+static int wifi_retry_count;
 
 static esp_err_t i2c_add_device(uint8_t addr, i2c_master_dev_handle_t *dev)
 {
@@ -111,6 +145,32 @@ static esp_err_t i2c_init(void)
     };
 
     return i2c_new_master_bus(&config, &i2c_bus);
+}
+
+static void weather_store_current(float aht_temperature, float humidity, float bmp_temperature, float pressure, float lux)
+{
+    uint32_t uptime_s = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+
+    xSemaphoreTake(weather_lock, portMAX_DELAY);
+
+    current_weather.aht_temperature = aht_temperature;
+    current_weather.humidity = humidity;
+    current_weather.bmp_temperature = bmp_temperature;
+    current_weather.pressure = pressure;
+    current_weather.lux = lux;
+    current_weather.uptime_s = uptime_s;
+
+    xSemaphoreGive(weather_lock);
+}
+
+static const char *json_float(char *buf, size_t len, float value)
+{
+    if (isnan(value)) {
+        return "null";
+    }
+
+    snprintf(buf, len, "%.2f", value);
+    return buf;
 }
 
 static void i2c_scan(void)
@@ -331,12 +391,179 @@ static esp_err_t bmp280_read(bmp280_t *bmp, float *temperature_c, float *pressur
     return ESP_OK;
 }
 
+static const char index_html[] =
+    "<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\">"
+    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+    "<title>Домашняя метеостанция</title>"
+    "<style>"
+    ":root{font-family:Arial,sans-serif;color:#182026;background:#eef3f5}"
+    "body{margin:0}.wrap{max-width:1100px;margin:0 auto;padding:20px}"
+    "h1{font-size:28px;margin:8px 0 18px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}"
+    ".card{background:white;border:1px solid #d8e0e5;border-radius:8px;padding:14px}.label{font-size:13px;color:#66737c}"
+    ".value{font-size:30px;font-weight:700;margin-top:8px}.unit{font-size:16px;color:#66737c;margin-left:3px}"
+    ".status{color:#66737c;margin:0 0 14px}"
+    "@media(max-width:640px){.wrap{padding:12px}.value{font-size:24px}}"
+    "</style></head><body><main class=\"wrap\">"
+    "<h1>Домашняя метеостанция</h1><p class=\"status\" id=\"status\">Загрузка...</p>"
+    "<section class=\"grid\">"
+    "<div class=\"card\"><div class=\"label\">AHT20 температура</div><div class=\"value\"><span id=\"aht_t\">--</span><span class=\"unit\">C</span></div></div>"
+    "<div class=\"card\"><div class=\"label\">Влажность</div><div class=\"value\"><span id=\"hum\">--</span><span class=\"unit\">%</span></div></div>"
+    "<div class=\"card\"><div class=\"label\">BMP280 температура</div><div class=\"value\"><span id=\"bmp_t\">--</span><span class=\"unit\">C</span></div></div>"
+    "<div class=\"card\"><div class=\"label\">Давление</div><div class=\"value\"><span id=\"press\">--</span><span class=\"unit\">hPa</span></div></div>"
+    "<div class=\"card\"><div class=\"label\">Освещенность</div><div class=\"value\"><span id=\"lux\">--</span><span class=\"unit\">lx</span></div></div>"
+    "</section>"
+    "</main><script>"
+    "const fmt=v=>v===null?'--':Number(v).toFixed(2);"
+    "async function load(){try{"
+    "const c=await (await fetch('/api/current')).json();"
+    "aht_t.textContent=fmt(c.aht_temperature);hum.textContent=fmt(c.humidity);bmp_t.textContent=fmt(c.bmp_temperature);press.textContent=fmt(c.pressure);lux.textContent=fmt(c.lux);"
+    "status.textContent='Обновлено, uptime '+Math.floor(c.uptime_s/60)+' мин';"
+    "}catch(e){status.textContent='Нет связи с ESP32';}}"
+    "load();setInterval(load,5000);"
+    "</script></body></html>";
+
+static esp_err_t index_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    return httpd_resp_send(req, index_html, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t current_handler(httpd_req_t *req)
+{
+    sensor_snapshot_t snapshot;
+    char aht[16], hum[16], bmp[16], pressure[16], lux[16];
+    char json[384];
+
+    xSemaphoreTake(weather_lock, portMAX_DELAY);
+    snapshot = current_weather;
+    xSemaphoreGive(weather_lock);
+
+    snprintf(json, sizeof(json),
+             "{\"aht_temperature\":%s,\"humidity\":%s,\"bmp_temperature\":%s,\"pressure\":%s,\"lux\":%s,\"uptime_s\":%lu}",
+             json_float(aht, sizeof(aht), snapshot.aht_temperature),
+             json_float(hum, sizeof(hum), snapshot.humidity),
+             json_float(bmp, sizeof(bmp), snapshot.bmp_temperature),
+             json_float(pressure, sizeof(pressure), snapshot.pressure),
+             json_float(lux, sizeof(lux), snapshot.lux),
+             (unsigned long)snapshot.uptime_s);
+
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+}
+
+static void start_webserver(void)
+{
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    httpd_handle_t server = NULL;
+
+    if (httpd_start(&server, &config) != ESP_OK) {
+        ESP_LOGE(TAG, "HTTP server start failed");
+        return;
+    }
+
+    const httpd_uri_t index_uri = {
+        .uri = "/",
+        .method = HTTP_GET,
+        .handler = index_handler,
+    };
+    const httpd_uri_t current_uri = {
+        .uri = "/api/current",
+        .method = HTTP_GET,
+        .handler = current_handler,
+    };
+
+    httpd_register_uri_handler(server, &index_uri);
+    httpd_register_uri_handler(server, &current_uri);
+    ESP_LOGI(TAG, "HTTP server started");
+}
+
+static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        if (wifi_retry_count < WIFI_MAX_RETRY) {
+            wifi_retry_count++;
+            esp_wifi_connect();
+            ESP_LOGW(TAG, "WiFi reconnect attempt %d", wifi_retry_count);
+        } else {
+            xEventGroupSetBits(wifi_event_group, WIFI_FAIL_BIT);
+        }
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        wifi_retry_count = 0;
+        ESP_LOGI(TAG, "WiFi connected, open http://" IPSTR, IP2STR(&event->ip_info.ip));
+        xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+}
+
+static esp_err_t wifi_init_sta(void)
+{
+    if (strlen(CONFIG_WEATHER_WIFI_SSID) == 0) {
+        ESP_LOGW(TAG, "WiFi SSID is empty. Run idf.py menuconfig -> Weather station");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    wifi_event_group = xEventGroupCreate();
+    ESP_RETURN_ON_ERROR(esp_netif_init(), TAG, "esp_netif_init failed");
+    ESP_RETURN_ON_ERROR(esp_event_loop_create_default(), TAG, "event loop init failed");
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t init_config = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_RETURN_ON_ERROR(esp_wifi_init(&init_config), TAG, "wifi init failed");
+    ESP_RETURN_ON_ERROR(esp_event_handler_instance_register(WIFI_EVENT,
+                                                            ESP_EVENT_ANY_ID,
+                                                            &wifi_event_handler,
+                                                            NULL,
+                                                            NULL),
+                        TAG, "wifi event register failed");
+    ESP_RETURN_ON_ERROR(esp_event_handler_instance_register(IP_EVENT,
+                                                            IP_EVENT_STA_GOT_IP,
+                                                            &wifi_event_handler,
+                                                            NULL,
+                                                            NULL),
+                        TAG, "ip event register failed");
+
+    wifi_config_t wifi_config = {0};
+    strlcpy((char *)wifi_config.sta.ssid, CONFIG_WEATHER_WIFI_SSID, sizeof(wifi_config.sta.ssid));
+    strlcpy((char *)wifi_config.sta.password, CONFIG_WEATHER_WIFI_PASSWORD, sizeof(wifi_config.sta.password));
+    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    wifi_config.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
+
+    ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "wifi mode failed");
+    ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &wifi_config), TAG, "wifi config failed");
+    ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "wifi start failed");
+
+    EventBits_t bits = xEventGroupWaitBits(wifi_event_group,
+                                           WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+                                           pdFALSE,
+                                           pdFALSE,
+                                           pdMS_TO_TICKS(20000));
+
+    if (bits & WIFI_CONNECTED_BIT) {
+        return ESP_OK;
+    }
+
+    ESP_LOGW(TAG, "WiFi connection was not established yet");
+    return ESP_ERR_TIMEOUT;
+}
+
 void app_main(void)
 {
     bmp280_t bmp = {0};
     bool aht20_ready = false;
     bool bmp280_ready = false;
     bool bh1750_ready = false;
+    esp_err_t nvs_err = nvs_flash_init();
+
+    if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES || nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        nvs_err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(nvs_err);
+
+    weather_lock = xSemaphoreCreateMutex();
+    ESP_ERROR_CHECK(weather_lock == NULL ? ESP_ERR_NO_MEM : ESP_OK);
 
     ESP_ERROR_CHECK(i2c_init());
     i2c_scan();
@@ -353,6 +580,12 @@ void app_main(void)
     }
     if (!bh1750_ready) {
         ESP_LOGW(TAG, "BH1750 not found at 0x%02X or 0x%02X", BH1750_ADDR_PRIMARY, BH1750_ADDR_SECONDARY);
+    }
+
+    if (wifi_init_sta() == ESP_OK) {
+        start_webserver();
+    } else {
+        ESP_LOGW(TAG, "Web page is disabled until WiFi connects");
     }
 
     while (true) {
@@ -382,6 +615,8 @@ void app_main(void)
                  pressure,
                  lux);
 
-        vTaskDelay(pdMS_TO_TICKS(5000));
+        weather_store_current(aht_temperature, humidity, bmp_temperature, pressure, lux);
+
+        vTaskDelay(pdMS_TO_TICKS(SAMPLE_PERIOD_MS));
     }
 }

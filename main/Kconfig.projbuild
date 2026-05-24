@@ -1,0 +1,15 @@
+menu "Weather station"
+
+    config WEATHER_WIFI_SSID
+        string "WiFi SSID"
+        default ""
+        help
+            Name of the home WiFi network that the ESP32 should connect to.
+
+    config WEATHER_WIFI_PASSWORD
+        string "WiFi password"
+        default ""
+        help
+            Password for the home WiFi network.
+
+endmenu
